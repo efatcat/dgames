@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Endless Halls</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #000; font-family: 'Courier New', monospace; }
+  canvas { display: block; }
+
+  #hud {
+    position: fixed; top: 15px; left: 15px;
+    color: #a00; font-size: 18px; text-shadow: 0 0 8px #a00;
+    pointer-events: none; z-index: 10;
+  }
+
+  #crosshair {
+    position: fixed; top: 50%; left: 50%;
+    width: 4px; height: 4px; margin: -2px 0 0 -2px;
+    background: rgba(255,255,255,0.6); border-radius: 50%;
+    pointer-events: none; z-index: 10;
+  }
+
+  #overlay {
+    position: fixed; inset: 0; display: flex;
+    flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.92); color: #ccc; z-index: 100;
+    text-align: center; padding: 20px;
+  }
+  #overlay h1 { font-size: 42px; color: #c00; margin-bottom: 20px; text-shadow: 0 0 20px #c00; letter-spacing: 4px; }
+  #overlay p { font-size: 16px; line-height: 1.8; max-width: 500px; margin-bottom: 12px; }
+  #overlay button {
+    margin-top: 25px; padding: 14px 40px; font-size: 18px;
+    font-family: inherit; background: transparent; color: #0f0;
+    border: 2px solid #0f0; cursor: pointer; letter-spacing: 3px;
+    text-shadow: 0 0 10px #0f0; box-shadow: 0 0 15px rgba(0,255,0,0.3);
+    transition: all 0.2s;
+  }
+  #overlay button:hover { background: #0f0; color: #000; box-shadow: 0 0 30px #0f0; }
+  .hidden { display: none !important; }
+  #vignette {
+    position: fixed; inset: 0; pointer-events: none; z-index: 5;
+    box-shadow: inset 0 0 200px 60px rgba(0,0,0,0.95);
+  }
+</style>
+</head>
+<body>
+
+<div id="vignette"></div>
+<div id="crosshair" class="hidden"></div>
+<div id="hud" class="hidden">ESCAPES: <span id="score">0</span></div>
+
+<div id="overlay">
+  <h1>THE ENDLESS HALLS</h1>
+  <p>Ты в лабиринте. Найди зелёную дверь.<br>Что-то ещё здесь есть.</p>
+  <p style="color:#888; font-size:14px;">WASD — движение · Мышь — обзор · Shift — бег</p>
+  <button id="startBtn">ВОЙТИ</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ============ КОНСТАНТЫ ============
+const CELL = 4;            // размер клетки лабиринта
+const GRID = 15;           // сетка GRID x GRID (нечётная для генерации)
+const WALL_H = 4;          // высота стен
+const PLAYER_RADIUS = 0.4;
+const PLAYER_HEIGHT = 1.7;
+const MONSTER_SPEED_PATROL = 1.8;
+const MONSTER_SPEED_CHASE = 4.2;
+const MONSTER_CHASE_DIST = 12;   // начинает погоню
+const MONSTER_KILL_DIST = 1.1;
+
+// ============ СЦЕНА ============
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+scene.fog = new THREE.FogExp2(0x000000, 0.09);
+
+const camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.05, 100);
+camera.position.y = PLAYER_HEIGHT;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ============ СВЕТ ============
+// Минимальный ambient, чтобы силуэты не были абсолютно чёрными
+scene.add(new THREE.AmbientLight(0x111122, 0.4));
+
+// Фонарик
+const flashlight = new THREE.SpotLight(0xffffee, 3, 22, Math.PI/6, 0.6, 1.2);
+flashlight.position.set(0.2, -0.1, 0);
+flashlight.target.position.set(0, 0, -1);
+camera.add(flashlight);
+camera.add(flashlight.target);
+scene.add(camera);
+
+// Слабый "блик" на самом игроке, чтобы видеть свои ноги
+const playerGlow = new THREE.PointLight(0x334466, 0.6, 4);
+camera.add(playerGlow);
+
+// ============ ЛАБИРИНТ ============
+// 1 = стена, 0 = проход
+let maze = [];
+let exitCell = { x: 1, y: 1 };
+let startCell = { x: 1, y: 1 };
+
+function generateMaze() {
+  // Инициализация — всё стены
+  maze = Array.from({ length: GRID }, () => Array(GRID).fill(1));
+
+  // Рекурсивный бэктрекинг (DFS) по нечётным клеткам
+  const stack = [];
+  const sx = 1, sy = 1;
+  maze[sy][sx] = 0;
+  stack.push({ x: sx, y: sy });
+
+  const dirs = [
+    { dx: 0, dy: -2 }, { dx: 0, dy: 2 },
+    { dx: -2, dy: 0 }, { dx: 2, dy: 0 }
+  ];
+
+  while (stack.length) {
+    const cur = stack[stack.length - 1];
+    const neighbors = [];
+    for (const d of dirs) {
+      const nx = cur.x + d.dx;
+      const ny = cur.y + d.dy;
+      if (nx > 0 && nx < GRID-1 && ny > 0 && ny < GRID-1 && maze[ny][nx] === 1) {
+        neighbors.push({ x: nx, y: ny, dx: d.dx, dy: d.dy });
+      }
+    }
+    if (neighbors.length === 0) {
+      stack.pop();
+    } else {
+      const n = neighbors[Math.floor(Math.random() * neighbors.length)];
+      // Прорубаем стену между клетками
+      maze[cur.y + n.dy/2][cur.x + n.dx/2] = 0;
+      maze[n.y][n.x] = 0;
+      stack.push({ x: n.x, y: n.y });
+    }
+  }
+
+  // Выход — самая дальняя по BFS от старта клетка
+  startCell = { x: 1, y: 1 };
+  const dist = bfsDistances(startCell.x, startCell.y);
+  let best = { x: 1, y: 1, d: -1 };
+  for (let y = 1; y < GRID-1; y++) {
+    for (let x = 1; x < GRID-1; x++) {
+      if (maze[y][x] === 0 && dist[y][x] > best.d) {
+        best = { x, y, d: dist[y][x] };
+      }
+    }
+  }
+  exitCell = { x: best.x, y: best.y };
+}
+
+function bfsDistances(sx, sy) {
+  const dist = Array.from({ length: GRID }, () => Array(GRID).fill(-1));
+  const q = [{ x: sx, y: sy }];
+  dist[sy][sx] = 0;
+  const dirs = [{dx:0,dy:-1},{dx:0,dy:1},{dx:-1,dy:0},{dx:1,dy:0}];
+  while (q.length) {
+    const c = q.shift();
+    for (const d of dirs) {
+      const nx = c.x + d.dx, ny = c.y + d.dy;
+      if (nx >= 0 && nx < GRID && ny >= 0 && ny < GRID &&
+          maze[ny][nx] === 0 && dist[ny][nx] === -1) {
+        dist[ny][nx] = dist[c.y][c.x] + 1;
+        q.push({ x: nx, y: ny });
+      }
+    }
+  }
+  return dist;
+}
+
+// BFS-путь от (sx,sy) до (tx,ty). Возвращает массив клеток или null.
+function bfsPath(sx, sy, tx, ty) {
+  if (maze[sy][sx] !== 0 || maze[ty][tx] !== 0) return null;
+  const prev = Array.from({ length: GRID }, () => Array(GRID).fill(null));
+  const visited = Array.from({ length: GRID }, () => Array(GRID).fill(false));
+  const q = [{ x: sx, y: sy }];
+  visited[sy][sx] = true;
+  const dirs = [{dx:0,dy:-1},{dx:0,dy:1},{dx:-1,dy:0},{dx:1,dy:0}];
+
+  while (q.length) {
+    const c = q.shift();
+    if (c.x === tx && c.y === ty) {
+      const path = [];
+      let cur = c;
+      while (cur) { path.push(cur); cur = prev[cur.y][cur.x]; }
+      return path.reverse();
+    }
+    for (const d of dirs) {
+      const nx = c.x + d.dx, ny = c.y + d.dy;
+      if (nx >= 0 && nx < GRID && ny >= 0 && ny < GRID &&
+          maze[ny][nx] === 0 && !visited[ny][nx]) {
+        visited[ny][nx] = true;
+        prev[ny][nx] = c;
+        q.push({ x: nx, y: ny });
+      }
+    }
+  }
+  return null;
+}
+
+// ============ ГЕОМЕТРИЯ ============
+const wallMat = new THREE.MeshStandardMaterial({
+  color: 0x333333, roughness: 0.95, metalness: 0.05
+});
+const floorMat = new THREE.MeshStandardMaterial({
+  color: 0x1a1a1a, roughness: 1.0
+});
+const ceilMat = new THREE.MeshStandardMaterial({
+  color: 0x0a0a0a, roughness: 1.0
+});
+
+let worldGroup = new THREE.Group();
+scene.add(worldGroup);
+
+const wallGeo = new THREE.BoxGeometry(CELL, WALL_H, CELL);
+const floorGeo = new THREE.BoxGeometry(CELL, 0.2, CELL);
+
+function cellToWorld(cx, cy) {
+  return { x: (cx - GRID/2 + 0.5) * CELL, z: (cy - GRID/2 + 0.5) * CELL };
+}
+
+function buildWorld() {
+  // Удаляем старый мир
+  while (worldGroup.children.length) {
+    const c = worldGroup.children.pop();
+    c.geometry?.dispose?.();
+  }
+
+  for (let y = 0; y < GRID; y++) {
+    for (let x = 0; x < GRID; x++) {
+      const { x: wx, z: wz } = cellToWorld(x, y);
+      if (maze[y][x] === 1) {
+        const wall = new THREE.Mesh(wallGeo, wallMat);
+        wall.position.set(wx, WALL_H/2, wz);
+        worldGroup.add(wall);
+      } else {
+        const floor = new THREE.Mesh(floorGeo, floorMat);
+        floor.position.set(wx, -0.1, wz);
+        worldGroup.add(floor);
+
+        const ceil = new THREE.Mesh(floorGeo, ceilMat);
+        ceil.position.set(wx, WALL_H + 0.1, wz);
+        worldGroup.add(ceil);
+      }
+    }
+  }
+
+  // Дверь-выход
+  const { x: ex, z: ez } = cellToWorld(exitCell.x, exitCell.y);
+  const doorMat = new THREE.MeshStandardMaterial({
+    color: 0x00ff44, emissive: 0x00ff44, emissiveIntensity: 1.5
+  });
+  const door = new THREE.Mesh(new THREE.BoxGeometry(1.2, 2.6, 0.2), doorMat);
+  door.position.set(ex, 1.3, ez);
+  worldGroup.add(door);
+
+  const doorLight = new THREE.PointLight(0x00ff44, 3, 8);
+  doorLight.position.set(ex, 1.5, ez);
+  worldGroup.add(doorLight);
+}
+
+// ============ ИГРОК ============
+const player = {
+  x: 0, z: 0,          // мировые координаты
+  yaw: 0, pitch: 0,
+  velocity: new THREE.Vector2(0, 0),
+  keys: {},
+  alive: true
+};
+
+function playerCell() {
+  return {
+    x: Math.round(player.x / CELL + GRID/2 - 0.5),
+    y: Math.round(player.z / CELL + GRID/2 - 0.5)
+  };
+}
+
+// Коллизии со стенами: проверяем 4 угла "капсулы" игрока
+function isBlocked(wx, wz) {
+  const r = PLAYER_RADIUS;
+  const points = [
+    [wx - r, wz - r], [wx + r, wz - r],
+    [wx - r, wz + r], [wx + r, wz + r]
+  ];
+  for (const [px, pz] of points) {
+    const cx = Math.floor(px / CELL + GRID/2);
+    const cy = Math.floor(pz / CELL + GRID/2);
+    if (cx < 0 || cx >= GRID || cy < 0 || cy >= GRID) return true;
+    if (maze[cy][cx] === 1) return true;
+  }
+  return false;
+}
+
+// ============ МОНСТР ============
+const monster = {
+  mesh: null,
+  x: 0, z: 0,
+  path: [],
+  pathTimer: 0,
+  state: 'patrol',
+  targetCell: null,
+  lastPlayerCell: null
+};
+
+function createMonster() {
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0xff0000, emissive: 0x660000, emissiveIntensity: 0.8,
+    roughness: 0.4
+  });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.8, 2.2, 0.8), mat);
+  body.position.y = 1.1;
+
+  const eyeMat = new THREE.MeshStandardMaterial({
+    color: 0xffff00, emissive: 0xffff00, emissiveIntensity: 3
+  });
+  const eyeL = new THREE.Mesh(new THREE.SphereGeometry(0.1, 8, 8), eyeMat);
+  const eyeR = eyeL.clone();
+  eyeL.position.set(-0.18, 1.9, -0.4);
+  eyeR.position.set(0.18, 1.9, -0.4);
+  body.add(eyeL, eyeR);
+
+  const light = new THREE.PointLight(0xff2200, 1.2, 5);
+  light.position.set(0, 1.5, 0);
+  body.add(light);
+
+  const group = new THREE.Group();
+  group.add(body);
+  return group;
+}
+
+function findFarthestFreeCell(fromX, fromY) {
+  const dist = bfsDistances(fromX, fromY);
+  let best = { x: fromX, y: fromY, d: -1 };
+  for (let y = 1; y < GRID-1; y++) {
+    for (let x = 1; x < GRID-1; x++) {
+      if (maze[y][x] === 0 && dist[y][x] > best.d) best = { x, y, d: dist[y][x] };
+    }
+  }
+  return { x: best.x, y: best.y };
+}
+
+function resetMonster() {
+  // Спавним далеко от игрока
+  const pc = playerCell();
+  const far = findFarthestFreeCell(pc.x, pc.y);
+  const { x: wx, z: wz } = cellToWorld(far.x, far.y);
+  monster.x = wx;
+  monster.z = wz;
+  monster.path = [];
+  monster.pathTimer = 0;
+  monster.state = 'patrol';
+  monster.targetCell = null;
+  monster.lastPlayerCell = null;
+
+  if (monster.mesh) scene.remove(monster.mesh);
+  monster.mesh = createMonster();
+  monster.mesh.position.set(wx, 0, wz);
+  scene.add(monster.mesh);
+}
+
+// Пересчёт пути монстра к цели (в клетках)
+function repathMonster(tx, ty) {
+  const mc = worldToCell(monster.x, monster.z);
+  const path = bfsPath(mc.x, mc.y, tx, ty);
+  if (path && path.length > 0) {
+    monster.path = path.slice(1); // без текущей клетки
+  }
+}
+
+function worldToCell(wx, wz) {
+  return {
+    x: Math.max(0, Math.min(GRID-1, Math.floor(wx / CELL + GRID/2))),
+    y: Math.max(0, Math.min(GRID-1, Math.floor(wz / CELL + GRID/2)))
+  };
+}
+
+function updateMonster(dt) {
+  if (!player.alive) return;
+
+  const pc = playerCell();
+  const distToPlayer = Math.hypot(monster.x - player.x, monster.z - player.z);
+
+  // --- Определяем состояние ---
+  if (distToPlayer < MONSTER_CHASE_DIST) {
+    monster.state = 'chase';
+  } else if (monster.state === 'chase' && distToPlayer > MONSTER_CHASE_DIST * 1.5) {
+    monster.state = 'patrol';
+  }
+
+  // --- Погоня: пересчитываем путь к игроку ---
+  if (monster.state === 'chase') {
+    monster.pathTimer -= dt;
+    if (monster.pathTimer <= 0 ||
+        !monster.lastPlayerCell ||
+        monster.lastPlayerCell.x !== pc.x ||
+        monster.lastPlayerCell.y !== pc.y) {
+      repathMonster(pc.x, pc.y);
+      monster.lastPlayerCell = { ...pc };
+      monster.pathTimer = 0.4;
+    }
+  } else {
+    // --- Патруль: идём к случайной дальней точке ---
+    if (!monster.path.length) {
+      const far = findFarthestFreeCell(
+        Math.floor(Math.random() * GRID),
+        Math.floor(Math.random() * GRID)
+      );
+      repathMonster(far.x, far.y);
+      monster.pathTimer = 0;
+    }
+  }
+
+  // --- Движение по пути ---
+  if (monster.path.length > 0) {
+    const next = monster.path[0];
+    const { x: tx, z: tz } = cellToWorld(next.x, next.y);
+    const dx = tx - monster.x;
+    const dz = tz - monster.z;
+    const d = Math.hypot(dx, dz);
+    const speed = monster.state === 'chase' ? MONSTER_SPEED_CHASE : MONSTER_SPEED_PATROL;
+
+    if (d < 0.15) {
+      monster.x = tx;
+      monster.z = tz;
+      monster.path.shift();
+    } else {
+      monster.x += (dx / d) * speed * dt;
+      monster.z += (dz / d) * speed * dt;
+    }
+    monster.mesh.position.set(monster.x, 0, monster.z);
+    // Поворот к цели
+    monster.mesh.rotation.y = Math.atan2(dx, dz);
+  }
+
+  // --- Убийство ---
+  if (distToPlayer < MONSTER_KILL_DIST) {
+    die();
+  }
+}
+
+// ============ УПРАВЛЕНИЕ ============
+const keys = {};
+addEventListener('keydown', e => { keys[e.code] = true; });
+addEventListener('keyup', e => { keys[e.code] = false; });
+
+let pointerLocked = false;
+document.addEventListener('pointerlockchange', () => {
+  pointerLocked = document.pointerLockElement === renderer.domElement;
+});
+
+addEventListener('mousemove', e => {
+  if (!pointerLocked || !player.alive) return;
+  player.yaw -= e.movementX * 0.0022;
+  player.pitch -= e.movementY * 0.0022;
+  player.pitch = Math.max(-Math.PI/2 + 0.1, Math.min(Math.PI/2 - 0.1, player.pitch));
+});
+
+// ============ ИГРОВОЙ ЦИКЛ ============
+let lastTime = performance.now();
+let score = 0;
+
+function updatePlayer(dt) {
+  if (!player.alive) return;
+
+  const forward = new THREE.Vector2(-Math.sin(player.yaw), -Math.cos(player.yaw));
+  const right = new THREE.Vector2(Math.cos(player.yaw), -Math.sin(player.yaw));
+
+  let move = new THREE.Vector2(0, 0);
+  if (keys['KeyW']) move.add(forward);
+  if (keys['KeyS']) move.sub(forward);
+  if (keys['KeyD']) move.add(right);
+  if (keys['KeyA']) move.sub(right);
+
+  if (move.lengthSq() > 0) {
+    move.normalize();
+    const run = keys['ShiftLeft'] || keys['ShiftRight'];
+    const speed = run ? 6.5 : 3.5;
+    const nx = player.x + move.x * speed * dt;
+    const nz = player.z + move.y * speed * dt;
+
+    // Раздельные оси — чтобы скользить вдоль стен
+    if (!isBlocked(nx, player.z)) player.x = nx;
+    if (!isBlocked(player.x, nz)) player.z = nz;
+  }
+
+  camera.position.x = player.x;
+  camera.position.z = player.z;
+  camera.position.y = PLAYER_HEIGHT;
+
+  // Камера смотрит по yaw/pitch
+  const dir = new THREE.Vector3(
+    -Math.sin(player.yaw) * Math.cos(player.pitch),
+    Math.sin(player.pitch),
+    -Math.cos(player.yaw) * Math.cos(player.pitch)
+  );
+  camera.lookAt(
+    player.x + dir.x,
+    PLAYER_HEIGHT + dir.y,
+    player.z + dir.z
+  );
+
+  // Проверка выхода
+  const pc = playerCell();
+  if (pc.x === exitCell.x && pc.y === exitCell.y) {
+    escape();
+  }
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  dt = Math.min(dt, 0.05); // защита от телепорта при сворачивании вкладки
+
+  if (running) {
+    updatePlayer(dt);
+    updateMonster(dt);
+  }
+
+  renderer.render(scene, camera);
+}
+
+// ============ СТАРТ / СМЕРТЬ / ПОБЕГ ============
+let running = false;
+
+function startGame() {
+  generateMaze();
+  buildWorld();
+
+  const { x: wx, z: wz } = cellToWorld(startCell.x, startCell.y);
+  player.x = wx;
+  player.z = wz;
+  player.yaw = 0;
+  player.pitch = 0;
+  player.alive = true;
+
+  resetMonster();
+
+  document.getElementById('overlay').classList.add('hidden');
+  document.getElementById('hud').classList.remove('hidden');
+  document.getElementById('crosshair').classList.remove('hidden');
+
+  renderer.domElement.requestPointerLock();
+  running = true;
+  lastTime = performance.now();
+}
+
+function die() {
+  if (!player.alive) return;
+  player.alive = false;
+  running = false;
+  document.exitPointerLock();
+
+  const ov = document.getElementById('overlay');
+  ov.innerHTML = `
+    <h1 style="color:#c00;">ТЫ УМЕР</h1>
+    <p style="color:#888;">Оно нашло тебя.</p>
+    <button id="startBtn">ЕЩЁ РАЗ</button>
+  `;
+  ov.classList.remove('hidden');
+  document.getElementById('startBtn').onclick = startGame;
+  document.getElementById('crosshair').classList.add('hidden');
+}
+
+function escape() {
+  if (!player.alive) return;
+  player.alive = false;
+  running = false;
+  document.exitPointerLock();
+  score++;
+  document.getElementById('score').textContent = score;
+
+  const ov = document.getElementById('overlay');
+  ov.innerHTML = `
+    <h1 style="color:#0f0;">ТЫ ВЫБРАЛСЯ</h1>
+    <p style="color:#888;">Пока что. Лабиринт ждёт снова.</p>
+    <p style="color:#0f0; font-size:20px; margin-top:16px;">Побегов: ${score}</p>
+    <button id="startBtn">ДАЛЬШЕ</button>
+  `;
+  ov.classList.remove('hidden');
+  document.getElementById('startBtn').onclick = startGame;
+  document.getElementById('crosshair').classList.add('hidden');
+}
+
+// Кнопка старта
+document.getElementById('startBtn').onclick = () => {
+  // Генерируем мир до старта, чтобы избежать пустого кадра
+  startGame();
+};
+
+// Первичная генерация (чтобы сцена не была пустой под оверлеем)
+generateMaze();
+buildWorld();
+
+animate();
+</script>
+</body>
+</html>
